@@ -55,14 +55,14 @@ impl<'a> GPULock<'a> {
                     for (index, device) in devices.iter().enumerate() {
                         let uid = device.unique_id();
                         let path = tmp_path(GPU_LOCK_NAME, Some(uid));
-                        debug!("Acquiring GPU lock {}/{} at {:?} ...", index, val, &path);
+                        info!("Acquiring GPU lock {}/{} at {:?} ...", index, val, &path);
                         let file = File::create(&path).unwrap_or_else(|_| {
                             panic!("Cannot create GPU {:?} lock file at {:?}", uid, &path)
                         });
                         if file.try_lock_exclusive().is_err() {
                             continue;
                         }
-                        debug!("GPU lock acquired at {:?}", path);
+                        info!("GPU lock acquired at {:?}", path);
                         locks.push(LockInfo {
                             file,
                             path,
