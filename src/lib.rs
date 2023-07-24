@@ -149,6 +149,9 @@ pub mod groth16;
 pub mod multiexp;
 pub mod util_cs;
 
+pub mod settings;
+pub use settings::*;
+
 mod lc;
 pub use lc::{Index, LinearCombination, Variable};
 mod constraint_system;

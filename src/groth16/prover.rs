@@ -30,7 +30,7 @@ use pairing::Engine;
 use std::thread::sleep;
 use crate::groth16::verify_proof;
 use crate::groth16::PreparedVerifyingKey;
-use cuda_builder_ffi::params::*;
+use crate::settings::*;
 
 static RNNING_SYN_THREAD_NUM: AtomicUsize = AtomicUsize::new(0);
 static RNNING_GPU_THREAD_NUM: AtomicUsize = AtomicUsize::new(0);
