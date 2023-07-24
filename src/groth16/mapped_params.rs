@@ -11,9 +11,24 @@ use std::fs::File;
 use std::io;
 use std::ops::Range;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::mem;
+use blstrs::{Bls12};
+use pairing::Engine;
+use log::info;
 
 use super::{ParameterSource, PreparedVerifyingKey, VerifyingKey};
+
+lazy_static::lazy_static! {
+    pub static ref PARAMS_H_CACHE: Arc<Mutex<HashMap<usize, (Arc<Vec<<Bls12 as Engine>::G1Affine>>, usize)>>> = Arc::new(Mutex::new(HashMap::new()));
+    pub static ref PARAMS_L_CACHE: Arc<Mutex<HashMap<usize, (Arc<Vec<<Bls12 as Engine>::G1Affine>>, usize)>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    pub static ref PARAMS_A_CACHE: Arc<Mutex<HashMap<usize, ((Arc<Vec<<Bls12 as Engine>::G1Affine>>, usize), (Arc<Vec<<Bls12 as Engine>::G1Affine>>, usize))>>> = Arc::new(Mutex::new(HashMap::new()));
+    pub static ref PARAMS_B_G1_CACHE: Arc<Mutex<HashMap<usize, ((Arc<Vec<<Bls12 as Engine>::G1Affine>>, usize), (Arc<Vec<<Bls12 as Engine>::G1Affine>>, usize))>>> = Arc::new(Mutex::new(HashMap::new()));
+    pub static ref PARAMS_B_G2_CACHE: Arc<Mutex<HashMap<usize, ((Arc<Vec<<Bls12 as Engine>::G2Affine>>, usize), (Arc<Vec<<Bls12 as Engine>::G2Affine>>, usize))>>> = Arc::new(Mutex::new(HashMap::new()));
+}
+
 
 pub struct MappedParameters<E>
 where
@@ -135,6 +150,163 @@ where
         let builder: Arc<Vec<_>> = Arc::new(builder);
 
         Ok(((builder.clone(), 0), (builder, num_inputs)))
+    }
+    fn get_h_cached(&self, _num_h: usize, key: usize) -> Result<Self::G1Builder, SynthesisError>
+    {
+        info!("_num_h: {:?}", _num_h);
+        info!("cache key: {:?}", key);
+        let mut params_h_cache = (*PARAMS_H_CACHE).lock().unwrap();
+        let cached_h = params_h_cache.get(&key);
+        unsafe {
+            match cached_h {
+                Some(params) => {
+                    info!("There is already a cached entry in cache h");
+                    let h_raw = params.clone();
+                    unsafe {
+                        let h = mem::transmute::<(Arc<Vec<<Bls12 as Engine>::G1Affine>>, usize), Self::G1Builder>(h_raw);
+                        Ok(h)
+                    }
+                },
+                None => {
+                    info!("nothing cached, build new cache h");
+                    let h = self.get_h(_num_h).unwrap();
+                    unsafe {
+                        let h_raw = mem::transmute::<Self::G1Builder, (Arc<Vec<<Bls12 as Engine>::G1Affine>>, usize)>(h.clone());
+                        params_h_cache.insert(key, h_raw);
+                    }
+                    Ok(h)
+                }
+            }
+        }
+    }
+    fn get_l_cached(&self, _num_l: usize, key: usize) -> Result<Self::G1Builder, SynthesisError> {
+        info!("_num_l: {:?}", _num_l);
+        info!("cache key: {:?}", key);
+        let mut params_l_cache = (*PARAMS_L_CACHE).lock().unwrap();
+        let cached_l = params_l_cache.get(&key);
+        unsafe {
+            match cached_l {
+                Some(params) => {
+                    info!("There is already a cached entry in cache l");
+                    let l_raw = params.clone();
+                    unsafe {
+                        let l = mem::transmute::<(Arc<Vec<<Bls12 as Engine>::G1Affine>>, usize), Self::G1Builder>(l_raw);
+                        Ok(l)
+                    }
+                },
+                None => {
+                    info!("nothing cached, build new cache l");
+                    let l = self.get_l(_num_l).unwrap();
+                    unsafe {
+                        let l_raw = mem::transmute::<Self::G1Builder, (Arc<Vec<<Bls12 as Engine>::G1Affine>>, usize)>(l.clone());
+                        params_l_cache.insert(key, l_raw);
+                    }
+                    Ok(l)
+                }
+            }
+        }
+    }
+    fn get_a_cached(
+        &self,
+        num_inputs: usize,
+        _num_a: usize,
+        key: usize
+    ) -> Result<(Self::G1Builder, Self::G1Builder), SynthesisError> {
+        info!("Before acquire lock for cache a");
+        info!("cache key: {:?}", key);
+        let mut params_a_cache = (*PARAMS_A_CACHE).lock().unwrap();
+        let cached_a = params_a_cache.get(&key);
+        unsafe {
+            match cached_a {
+                Some(params) => {
+                    info!("There is already a cached entry in cache a");
+                    let a_raw = params.clone();
+                    unsafe {
+                        let a = mem::transmute::<((Arc<Vec<<Bls12 as Engine>::G1Affine>>, usize), (Arc<Vec<<Bls12 as Engine>::G1Affine>>, usize)),
+                            (Self::G1Builder, Self::G1Builder)>(a_raw);
+                        Ok(a)
+                    }
+                },
+                None => {
+                    info!("nothing cached, build new cache a");
+                    let a = self.get_a(num_inputs, _num_a).unwrap();
+                    unsafe {
+                        let a_raw = mem::transmute::<(Self::G1Builder, Self::G1Builder),
+                            ((Arc<Vec<<Bls12 as Engine>::G1Affine>>, usize), (Arc<Vec<<Bls12 as Engine>::G1Affine>>, usize))>(a.clone());
+                        params_a_cache.insert(key, a_raw);
+                    }
+                    Ok(a)
+                }
+            }
+        }
+    }
+    fn get_b_g1_cached(
+        &self,
+        num_inputs: usize,
+        _num_b_g1: usize,
+        key: usize
+    ) -> Result<(Self::G1Builder, Self::G1Builder), SynthesisError> {
+        info!("Before acquire lock for cache b g1");
+        info!("cache key: {:?}", key);
+        let mut params_b_g1_cache = (*PARAMS_B_G1_CACHE).lock().unwrap();
+        let cached_b_g1 = params_b_g1_cache.get(&key);
+        unsafe {
+            match cached_b_g1 {
+                Some(params) => {
+                    info!("There is already a cached entry in cache b_g1");
+                    let b_g1_raw = params.clone();
+                    unsafe {
+                        let b_g1 = mem::transmute::<((Arc<Vec<<Bls12 as Engine>::G1Affine>>, usize), (Arc<Vec<<Bls12 as Engine>::G1Affine>>, usize)),
+                            (Self::G1Builder, Self::G1Builder)>(b_g1_raw);
+                        Ok(b_g1)
+                    }
+                },
+                None => {
+                    info!("nothing cached, build new cache b_g1");
+                    let b_g1 = self.get_b_g1(num_inputs, _num_b_g1).unwrap();
+                    unsafe {
+                        let b_g1_raw = mem::transmute::<(Self::G1Builder, Self::G1Builder),
+                            ((Arc<Vec<<Bls12 as Engine>::G1Affine>>, usize), (Arc<Vec<<Bls12 as Engine>::G1Affine>>, usize))>(b_g1.clone());
+                        params_b_g1_cache.insert(key, b_g1_raw);
+                    }
+                    Ok(b_g1)
+                }
+            }
+        }
+    }
+    fn get_b_g2_cached(
+        &self,
+        num_inputs: usize,
+        _num_b_g2: usize,
+        key: usize
+    ) -> Result<(Self::G2Builder, Self::G2Builder), SynthesisError> {
+        info!("Before acquire lock for cache b g2");
+        info!("cache key: {:?}", key);
+        let mut params_b_g2_cache = (*PARAMS_B_G2_CACHE).lock().unwrap();
+        let cached_b_g2 = params_b_g2_cache.get(&key);
+        unsafe {
+            match cached_b_g2 {
+                Some(params) => {
+                    info!("There is already a cached entry in cache b_g2");
+                    let b_g2_raw = params.clone();
+                    unsafe {
+                        let b_g2 = mem::transmute::<((Arc<Vec<<Bls12 as Engine>::G2Affine>>, usize), (Arc<Vec<<Bls12 as Engine>::G2Affine>>, usize)),
+                            (Self::G2Builder, Self::G2Builder)>(b_g2_raw);
+                        Ok(b_g2)
+                    }
+                },
+                None => {
+                    info!("nothing cached, build new cache b_g2");
+                    let b_g2 = self.get_b_g2(num_inputs, _num_b_g2).unwrap();
+                    unsafe {
+                        let b_g2_raw = mem::transmute::<(Self::G2Builder, Self::G2Builder),
+                            ((Arc<Vec<<Bls12 as Engine>::G2Affine>>, usize), (Arc<Vec<<Bls12 as Engine>::G2Affine>>, usize))>(b_g2.clone());
+                        params_b_g2_cache.insert(key, b_g2_raw);
+                    }
+                    Ok(b_g2)
+                }
+            }
+        }
     }
 }
 

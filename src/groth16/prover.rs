@@ -1,10 +1,12 @@
 use std::ops::{AddAssign, Mul, MulAssign};
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Instant, Duration};
 
 use ff::{Field, PrimeField};
 use group::{prime::PrimeCurveAffine, Curve};
 use pairing::MultiMillerLoop;
+use rand::Rng;
 use rand_core::RngCore;
 use rayon::prelude::*;
 
@@ -19,10 +21,25 @@ use ec_gpu_gen::multiexp_cpu::{DensityTracker, FullDensity};
 use ec_gpu_gen::threadpool::{Worker, THREAD_POOL};
 #[cfg(any(feature = "cuda", feature = "opencl"))]
 use log::trace;
-use log::{debug, info};
+use log::{debug, info, warn};
 
 #[cfg(any(feature = "cuda", feature = "opencl"))]
 use crate::gpu::PriorityLock;
+
+use pairing::Engine;
+use std::thread::sleep;
+use crate::groth16::verify_proof;
+use crate::groth16::PreparedVerifyingKey;
+use cuda_builder_ffi::params::*;
+
+static RNNING_SYN_THREAD_NUM: AtomicUsize = AtomicUsize::new(0);
+static RNNING_GPU_THREAD_NUM: AtomicUsize = AtomicUsize::new(0);
+static THIS_THREAD_NUM: AtomicUsize = AtomicUsize::new(1);
+static RNNING_THREAD_NUM: AtomicUsize = AtomicUsize::new(0);
+static CACHE_BUILDING: AtomicUsize = AtomicUsize::new(0);
+
+static FFT_THRESH: usize = 9000;
+static FFT_N_VALUE: usize = 27; //2^27 = 134217728
 
 struct ProvingAssignment<Scalar: PrimeField> {
     // Density of queries
@@ -361,14 +378,14 @@ where
             *params_h = Some(params.get_h(n));
         });
 
-        let mut fft_kern = Some(LockedFftKernel::new(priority));
+        let mut fft_kern = Some(LockedFftKernel::new(priority, None));
         for prover in provers_ref {
             a_s.push(execute_fft(worker, prover, &mut fft_kern)?);
         }
         Ok(())
     })?;
 
-    let mut multiexp_g1_kern = LockedMultiexpKernel::<E::G1Affine>::new(priority);
+    let mut multiexp_g1_kern = LockedMultiexpKernel::<E::G1Affine>::new(priority, None);
     let params_h = params_h.unwrap()?;
 
     let mut h_s = Vec::with_capacity(num_circuits);
@@ -506,7 +523,7 @@ where
 
     // The multiexp kernel for G1 can only be initiated after the kernel for G1 was dropped. Else
     // it would block, trying to acquire the GPU lock.
-    let mut multiexp_g2_kern = LockedMultiexpKernel::<E::G2Affine>::new(priority);
+    let mut multiexp_g2_kern = LockedMultiexpKernel::<E::G2Affine>::new(priority, None);
 
     debug!("get b_g2");
     let (b_g2_inputs_source, b_g2_aux_source) = params_b_g2.unwrap()?;
@@ -784,5 +801,899 @@ mod tests {
                 assert_eq!(combined, full_assignment);
             }
         }
+    }
+}
+
+#[allow(clippy::clippy::needless_collect)]
+pub fn create_proof_single_priority<E, C, P: ParameterSource<E>>(
+    circuit: C,
+    params: Arc<P>,
+    r: E::Fr,
+    s: E::Fr,
+    priority: bool,
+) -> Result<Proof<E>, SynthesisError>
+    where
+        E: MultiMillerLoop,
+        C: Circuit<E::Fr> + Send,
+        E::Fr: GpuName,
+        E::G1Affine: GpuName,
+        E::G2Affine: GpuName,
+{
+    info!("[create_proof_single_priority] Start create_proof!!!");
+
+    let mut prover = ProvingAssignment::new();
+    prover.alloc_input(|| "", || Ok(E::Fr::ONE))?;
+
+    start_synthesize();
+    let prove_start = Instant::now();
+    let part_start = Instant::now();
+    info!("Before synthesize!");
+    {
+        circuit.synthesize(&mut prover)?;
+    }
+
+    info!("part 1 takes {:?}", part_start.elapsed());
+
+    //start_gpu_thread();
+    let part_start = Instant::now();
+
+    for i in 0..prover.input_assignment.len() {
+        prover.enforce(|| "", |lc| lc + Variable(Index::Input(i)), |lc| lc, |lc| lc);
+    }
+
+    let worker = Worker::new();
+
+    let vk = params.get_vk(prover.input_assignment.len())?;
+    info!("prover.a.len(), to determin if it's a seal or post, {:?}", prover.a.len());
+
+
+    let n = prover.a.len();
+    let key = n.clone();
+    let mut log_d = 0;
+    while (1 << log_d) < n {
+        log_d += 1;
+    }
+
+    let (post, gpu_mem_fft, gpu_mem_me_g1, gpu_mem_me_g2) = match prover.a.len()  {
+        130278869 => {
+            if inplace_fft(log_d) {
+                (false, 4267, 2369, 4281)
+            } else {
+                (false, 8359, 2369, 4281)
+            }
+        }, //v26 32G seal
+        373230 => (true, 0, 0, 0), //32G post
+        4433034 => (false, 1353, 512, 512), //v26 512M seal
+        320497 => (true, 0, 0, 0), //512M post
+        3852162 => (false, 679, 128,128), //v26 8M seal, consumed gpu memory parameter is incorrect!
+        // 512MiB
+        85489 => (true, 2048, 1024, 1024),
+        4423473 => (true, 2048, 1024, 1024),
+        57450484 => (true, 2048, 1024, 1024),
+        //8MiB
+        64289 => (true, 1024, 24, 24),
+        3844969 => (true, 1024, 24, 24),
+        10007508 => (true, 1024, 24,24), //v28 8M seal, consumed gpu memory parameter is incorrect!
+        v => {
+            warn!("The bin has problem with groth16 params, can't tell if post or not by params length len:{:?}",v);
+            if inplace_fft(log_d) {
+                (false, 4267, 2369, 4281)
+            } else {
+                (false, 8359, 2369, 4281)
+            }
+        }
+    };
+
+    // TODO: parallelize if it's even helpful
+    let input_assignment = Arc::new(
+        prover
+            .input_assignment
+            .into_iter()
+            .map(|s| s.to_repr())
+            .collect::<Vec<_>>(),
+    );
+
+    let aux_assignment = Arc::new(
+        prover
+            .aux_assignment
+            .into_iter()
+            .map(|s| s.to_repr())
+            .collect::<Vec<_>>(),
+    );
+
+    let a_aux_density = Arc::new(prover.a_aux_density);
+    let a_aux_density_total = a_aux_density.get_total_density();
+
+    let seg_start = Instant::now();
+
+    let b_input_density = Arc::new(prover.b_input_density);
+    let b_input_density_total = b_input_density.get_total_density();
+
+    info!(
+        "b_input_density time: {:?}",
+        seg_start.elapsed(),
+    );
+    let seg_start = Instant::now();
+
+    let b_aux_density = Arc::new(prover.b_aux_density);
+    let b_aux_density_total = b_aux_density.get_total_density();
+
+    info!(
+        "b_aux_density time: {:?}",
+        seg_start.elapsed(),
+    );
+
+    if (vk.delta_g1.is_identity() | vk.delta_g2.is_identity()).into() {
+        return Err(SynthesisError::UnexpectedIdentity);
+    }
+
+    finish_syntheize();
+
+    info!("part 2 takes {:?}", part_start.elapsed());
+    let part_start = Instant::now();
+
+    let (mut fft_kern, gpu_idx, gpued) = get_fft_kernals(log_d.clone(), post.clone(), gpu_mem_fft, priority);
+
+    info!("[kernal-release], start fft!!!");
+    #[cfg(any(feature = "cuda", feature = "opencl"))]
+        let prio_lock = if priority {
+        trace!("acquiring priority lock");
+        Some(PriorityLock::lock())
+    } else {
+        None
+    };
+
+    let a = {
+        let mut a = EvaluationDomain::from_coeffs(std::mem::replace(&mut prover.a, Vec::new()))?;
+        let mut b = EvaluationDomain::from_coeffs(std::mem::replace(&mut prover.b, Vec::new()))?;
+        let mut c = EvaluationDomain::from_coeffs(std::mem::replace(&mut prover.c, Vec::new()))?;
+
+        EvaluationDomain::ifft_many(&mut [&mut a, &mut b, &mut c], &worker, &mut fft_kern)?;
+        EvaluationDomain::coset_fft_many(&mut [&mut a, &mut b, &mut c], &worker, &mut fft_kern)?;
+
+        a.mul_assign(&worker, &b);
+        drop(b);
+        a.sub_assign(&worker, &c);
+        drop(c);
+
+        a.divide_by_z_on_coset(&worker);
+        a.icoset_fft(&worker, &mut fft_kern)?;
+
+        drop(fft_kern);
+        if gpued {
+            info!("[kernal-release]end, release fft GPU memory!");
+            finish_use_gpu(gpu_idx, gpu_mem_fft);
+        } else if GPU_BELL() {
+            info!("Release fft thread for a");
+            cpu_finish();
+        }
+
+        let a = a.into_coeffs();
+        let a_len = a.len() - 1;
+        let a = a
+            .into_par_iter()
+            .take(a_len)
+            .map(|s| s.to_repr())
+            .collect::<Vec<_>>();
+        Arc::new(a)
+    };
+
+
+    info!("part 3 takes {:?}", part_start.elapsed());
+
+    let part_start = Instant::now();
+
+    let (h, l, a_inputs, a_aux, b_g1_inputs, b_g1_aux, b_g2_inputs, b_g2_aux) = if (GPU_BELL()) && (PAR_BELL()) && !post {
+        info!("In the parellel mutliple exponent mode");
+        crossbeam::thread::scope(|s| -> Result<_, ()> {
+            let params_h = params.get_h_cached(a.len(), key).unwrap();
+            let h_handler = s.spawn(move |_|  {
+                info!("Start compute G1 H");
+                let (mut multiexp_kern, gpu_idx, gpued) = get_me_kernals::<E>(n, post, gpu_mem_me_g1, priority);
+                let mut multiexp_kern = multiexp_kern.unwrap();
+                info!("[kernal-release]me-k, start G1 H!!!");
+                let start_h = Instant::now();
+                let worker = Worker::new();
+                let h = multiexp(
+                    &worker,
+                    params_h,
+                    FullDensity,
+                    a,
+                    &mut multiexp_kern,
+                );
+                info!("Compute H takes: {:?}", start_h.elapsed());
+                drop(multiexp_kern);
+                if gpued {
+                    info!("[kernal-release]end, release G1 H GPU memory!");
+                    finish_use_gpu(gpu_idx, gpu_mem_me_g1);
+                }
+                else if GPU_BELL() {
+                    info!("Release CPU thread for h");
+                    cpu_finish();
+                }
+
+                h
+            });
+
+            let aux_assignment_l = aux_assignment.clone();
+            let params_l = params.get_l_cached(aux_assignment.len(), key).unwrap();
+            let l_handler = s.spawn(move |_|  {
+                info!("Start compute G1 L");
+                //let op_cpu = !cpu_running();
+                // let (mut multiexp_kern, gpu_idx, gpued) = LockedMultiexpKernel::<E::G1Affine>::new(priority);
+                // let mut multiexp_kern = LockedMultiexpKernel::<E::G1Affine>::new(priority);
+                let (mut multiexp_kern, gpu_idx, gpued) = get_me_kernals::<E>(n, post, gpu_mem_me_g1, priority);
+                let mut multiexp_kern = multiexp_kern.unwrap();
+                info!("[kernal-release]me-k, start!");
+                let start_l = Instant::now();
+                let worker = Worker::new();
+                let l = multiexp(
+                    &worker,
+                    params_l,
+                    FullDensity,
+                    aux_assignment_l,
+                    &mut multiexp_kern,
+                );
+                info!("Compute L takes: {:?}", start_l.elapsed());
+                drop(multiexp_kern);
+
+                if gpued {
+                    info!("[kernal-release]end, release l GPU memory!");
+                    finish_use_gpu(gpu_idx, gpu_mem_me_g1);
+                }
+                else if GPU_BELL() {
+                    info!("Release CPU thread for l");
+                    cpu_finish();
+                }
+                l
+            });
+
+
+            let b_aux_density_oth = b_aux_density.clone();
+            let b_input_density_oth = b_input_density.clone();
+            let input_assignment_oth = input_assignment.clone();
+            let aux_assignment_oth = aux_assignment.clone();
+
+            let (a_inputs_source, a_aux_source) =
+                params.get_a_cached(input_assignment.len(), a_aux_density_total, key).unwrap();
+            let (b_g1_inputs_source, b_g1_aux_source) =
+                params.get_b_g1_cached(b_input_density_total, b_aux_density_total, key).unwrap();
+            let other_g1_handler = s.spawn(move |_|  {
+                info!("Start compute G1 others");
+
+                let (mut multiexp_kern, gpu_idx, gpued) = get_me_kernals::<E>(n, post, gpu_mem_me_g1, priority);
+                let mut multiexp_kern = multiexp_kern.unwrap();
+                info!("[kernal-release]me-k, start G1!");
+                let start_1 = Instant::now();
+                let worker = Worker::new();
+                let a_inputs = multiexp(
+                    &worker,
+                    a_inputs_source,
+                    FullDensity,
+                    input_assignment_oth.clone(),
+                    &mut multiexp_kern,
+                );
+
+                info!("multiexp a_aux");
+
+                let a_aux = multiexp(
+                    &worker,
+                    a_aux_source,
+                    a_aux_density,
+                    aux_assignment_oth.clone(),
+                    &mut multiexp_kern,
+                );
+
+
+                info!("Start multiexp b_g1_inputs");
+
+                let b_g1_inputs = multiexp(
+                    &worker,
+                    b_g1_inputs_source,
+                    b_input_density_oth,
+                    input_assignment_oth,
+                    &mut multiexp_kern,
+                );
+
+                info!("Start multiexp b_g1_aux");
+                let b_g1_aux = multiexp(
+                    &worker,
+                    b_g1_aux_source,
+                    b_aux_density_oth,
+                    aux_assignment_oth,
+                    &mut multiexp_kern,
+                );
+
+                info!("Compute other G1 takes: {:?}", start_1.elapsed());
+                drop(multiexp_kern);
+                if gpued {
+                    info!("[kernal-release]end, release G1 GPU memory!");
+                    finish_use_gpu(gpu_idx, gpu_mem_me_g1);
+                } else if GPU_BELL() {
+                    info!("Release CPU thread for g1");
+                    cpu_finish();
+                }
+
+                (a_inputs, a_aux, b_g1_inputs, b_g1_aux)
+            });
+
+            let (b_g2_inputs_source, b_g2_aux_source) =
+                params.get_b_g2_cached(b_input_density_total, b_aux_density_total, key).unwrap();
+            let g2_handler = s.spawn(move |_|  {
+                info!("Start compute G2");
+
+                let (mut multiexp_kern, gpu_idx, gpued) = get_me_kernels_g2::<E>(n, post, gpu_mem_me_g2, priority);
+                let mut multiexp_kern = multiexp_kern.unwrap();
+                info!("[kernal-release]me-k, start G2!");
+                let g2_start = Instant::now();
+                info!("multiexp b_g2_inputs");
+                let worker = Worker::new();
+                let b_g2_inputs = multiexp(
+                    &worker,
+                    b_g2_inputs_source,
+                    b_input_density,
+                    input_assignment,
+                    &mut multiexp_kern
+                );
+                info!("multiexp b_g2_aux");
+
+                let b_g2_aux = multiexp(&worker, b_g2_aux_source, b_aux_density.clone(), aux_assignment.clone(), &mut multiexp_kern);
+                info!("Multiexp g2 time: {:?}", g2_start.elapsed());
+                drop(multiexp_kern);
+                if gpued {
+                    info!("[kernal-release]end, release G2 GPU memory!");
+                    finish_use_gpu(gpu_idx, gpu_mem_me_g2);
+                }
+                else if GPU_BELL() {
+                    info!("Release CPU thread for g2");
+                    cpu_finish();
+                }
+                (b_g2_inputs, b_g2_aux)
+            });
+
+            let h = h_handler.join().unwrap();
+            let l = l_handler.join().unwrap();
+            let (a_inputs, a_aux, b_g1_inputs, b_g1_aux) = other_g1_handler.join().unwrap();
+            let (b_g2_inputs, b_g2_aux) = g2_handler.join().unwrap();
+
+            Ok((h, l, a_inputs, a_aux, b_g1_inputs, b_g1_aux, b_g2_inputs, b_g2_aux))
+        }).unwrap().unwrap()
+
+    } else {
+        let (mut multiexp_kern, gpu_idx, gpued) = get_me_kernels_g2::<E>(n, post, gpu_mem_me_g2, priority);
+        let mut multiexp_kern = multiexp_kern.unwrap();
+
+        info!("[kernal-release]me-k start, start G2!");
+        info!("gpu_idx 2 : {}, post: {}", gpu_idx, post);
+        let g2_start = Instant::now();
+        let param_start = Instant::now();
+        let (b_g2_inputs_source, b_g2_aux_source) =
+            params.get_b_g2_cached(b_input_density_total, b_aux_density_total, key)?;
+        info!("param get b g2 takes: {:?}", param_start.elapsed());
+
+        info!("multiexp b_g2_inputs");
+        let b_g2_inputs = multiexp(
+            &worker,
+            b_g2_inputs_source,
+            b_input_density.clone(),
+            input_assignment.clone(),
+            &mut multiexp_kern
+        );
+        info!("multiexp b_g2_aux");
+
+        let b_g2_aux = multiexp(
+            &worker,
+            b_g2_aux_source,
+            b_aux_density.clone(),
+            aux_assignment.clone(),
+            &mut multiexp_kern);
+
+        info!("Multiexp g2 time: {:?}", g2_start.elapsed());
+
+        // _multiexp_kern_tmp = None;
+        drop(multiexp_kern);
+
+        if (GPU_BELL()) && gpued {
+            info!("[kernal-release]mek-k end, release G2 GPU memory!");
+            finish_use_gpu(gpu_idx, gpu_mem_me_g2);
+        } else if GPU_BELL() {
+            info!("Release CPU thread for b_g2_aux");
+            cpu_finish();
+        }
+
+        // let (mut multiexp_kern, gpu_idx, gpued) = LockedMultiexpKernel::<E::G1Affine>::new(priority);
+        let (mut multiexp_kern, gpu_idx, gpued) = get_me_kernals::<E>(n, post, gpu_mem_me_g1, priority);
+        let mut multiexp_kern = multiexp_kern.unwrap();
+        // let mut multiexp_kern = LockedMultiexpKernel::<E::G1Affine>::new(priority);
+        // let mut multiexp_kern = multiexp_kern.unwrap();
+        info!("[kernal-release]me-k, start H!");
+        info!("Start multiexp h");
+        let g1_start = Instant::now();
+        let start_h = Instant::now();
+        let params_h = params.get_h_cached(a.len(), key).unwrap();
+        let h = multiexp(
+            &worker,
+            params_h,
+            FullDensity,
+            a,
+            &mut multiexp_kern,
+        );
+        info!("Compute H takes: {:?}", start_h.elapsed());
+        info!("Start multiexp l");
+
+        let start_l = Instant::now();
+        let params_l = params.get_l_cached(aux_assignment.len(), key).unwrap();
+        let l = multiexp(
+            &worker,
+            params_l,
+            FullDensity,
+            aux_assignment.clone(),
+            &mut multiexp_kern,
+        );
+        info!("Compute L takes: {:?}", start_l.elapsed());
+        info!("Start multiexp a_inputs");
+
+        let param_start = Instant::now();
+        let (a_inputs_source, a_aux_source) =
+            params.get_a_cached(input_assignment.len(), a_aux_density_total, key)?;
+        info!("param get a takes: {:?}", param_start.elapsed());
+        if CACHE_BUILDING.load(Ordering::SeqCst) == 1 {
+            CACHE_BUILDING.fetch_sub(1, Ordering::SeqCst);
+        }
+
+        let a_inputs = multiexp(
+            &worker,
+            a_inputs_source,
+            FullDensity,
+            input_assignment.clone(),
+            &mut multiexp_kern,
+        );
+
+        info!("multiexp a_aux");
+
+        let a_aux = multiexp(
+            &worker,
+            a_aux_source,
+            a_aux_density,
+            aux_assignment.clone(),
+            &mut multiexp_kern,
+        );
+
+        info!("Start multiexp b_g1_inputs");
+        let param_start = Instant::now();
+        let (b_g1_inputs_source, b_g1_aux_source) =
+            params.get_b_g1_cached(b_input_density_total, b_aux_density_total, key)?;
+        info!("param get b g1 takes: {:?}", param_start.elapsed());
+        let b_g1_inputs = multiexp(
+            &worker,
+            b_g1_inputs_source,
+            b_input_density.clone(),
+            input_assignment.clone(),
+            &mut multiexp_kern,
+        );
+        info!("Start multiexp b_g1_aux");
+
+        let b_g1_aux = multiexp(
+            &worker,
+            b_g1_aux_source,
+            b_aux_density.clone(),
+            aux_assignment.clone(),
+            &mut multiexp_kern,
+        );
+        info!("Multiexp g1 time: {:?}", g1_start.elapsed());
+
+        if (vk.delta_g1.is_identity() | vk.delta_g2.is_identity()).into() {
+            return Err(SynthesisError::UnexpectedIdentity);
+        }
+
+        drop(multiexp_kern);
+
+        if GPU_BELL() && gpued {
+            info!("[kernal-release]mek-k end, release H GPU memory!");
+            finish_use_gpu(gpu_idx, gpu_mem_me_g1);
+        } else if GPU_BELL() {
+            info!("Release CPU thread for b_g1_aux");
+            cpu_finish();
+        }
+        info!("finished multiexp!");
+        (h, l, a_inputs, a_aux, b_g1_inputs, b_g1_aux, b_g2_inputs, b_g2_aux)
+    };
+
+    //finish_gpu_thread();
+
+    #[cfg(any(feature = "cuda", feature = "opencl"))]
+    {
+        trace!("dropping priority lock");
+        drop(prio_lock);
+    }
+    info!("part 4 takes {:?}", part_start.elapsed());
+    let part_start = Instant::now();
+
+    let mut g_a = vk.delta_g1.mul(r);
+    g_a.add_assign(&vk.alpha_g1);
+    let mut g_b = vk.delta_g2.mul(s);
+    g_b.add_assign(&vk.beta_g2);
+    let mut g_c;
+    {
+        let mut rs = r;
+        rs.mul_assign(&s);
+
+        g_c = vk.delta_g1.mul(rs);
+        g_c.add_assign(&vk.alpha_g1.mul(s));
+        g_c.add_assign(&vk.beta_g1.mul(r));
+    }
+    let mut a_answer = a_inputs.wait()?;
+    a_answer.add_assign(&a_aux.wait()?);
+    g_a.add_assign(&a_answer);
+    a_answer.mul_assign(s);
+    g_c.add_assign(&a_answer);
+
+    let mut b1_answer = b_g1_inputs.wait()?;
+    b1_answer.add_assign(&b_g1_aux.wait()?);
+    let mut b2_answer = b_g2_inputs.wait()?;
+    b2_answer.add_assign(&b_g2_aux.wait()?);
+
+    g_b.add_assign(&b2_answer);
+    b1_answer.mul_assign(r);
+    g_c.add_assign(&b1_answer);
+    g_c.add_assign(&h.wait()?);
+    g_c.add_assign(&l.wait()?);
+    info!("part 5 takes {:?}", part_start.elapsed());
+    info!("zksnark takes {:?}", prove_start.elapsed());
+    Ok(Proof {
+        a: g_a.to_affine(),
+        b: g_b.to_affine(),
+        c: g_c.to_affine(),
+    })
+
+}
+
+pub fn inplace_fft(fft_n: usize) -> bool {
+    info!("fft_n: {:?}", fft_n);
+    if fft_n == FFT_N_VALUE {
+        true
+    } else {
+        false
+    }
+}
+
+pub fn get_me_kernals<E: Engine>(_n: usize, post:bool, mem: usize, priority: bool) -> (Option<LockedMultiexpKernel<'static, E::G1Affine>>, usize, bool)
+    where
+        <E as Engine>::G1Affine: GpuName
+{
+    let start_time = Instant::now();
+    if post {
+        info!("post me kernal!");
+        let post_kernal = Some(LockedMultiexpKernel::<E::G1Affine>::new(priority, None));
+        return (post_kernal, 99, false)
+    } else {
+        info!("[get_me_kernals] get!!!!!");
+        if GPU_BELL() {
+            bell_start();
+            let mut rng = rand::thread_rng();
+            loop {
+                if !hash_rnning() {
+                    let rand_sleep = rng.gen_range(0..10);
+                    debug!("Random sleep {:?} MS", rand_sleep);
+                    sleep(Duration::from_millis(rand_sleep));
+                    let (gpu_ok, min_idx, gpu_id) = free_gpu_ok(mem);
+                    if gpu_ok {
+                        if !gpu_overloaded(min_idx) {
+                            let kern_2 = {
+                                Some(LockedMultiexpKernel::<E::G1Affine>::new(priority, Some(gpu_id)))
+                            };
+                            bell_finish();
+                            info!("GPU get_me_kernals takes: {:?}", start_time.elapsed());
+                            return (kern_2, min_idx, true)
+                        } else {
+                            let start_sub = Instant::now();
+                            finish_use_gpu(min_idx, mem);
+                            info!("BELL fetch sub takes: {:?}, abnormal situation", start_sub.elapsed());
+                            let sleep_time = Duration::from_millis(WAIT_GPU);
+                            debug!("Competition happend, all GPU is full for Multiexp, sleep {:?} MS", WAIT_GPU);
+                            sleep(sleep_time);
+                        }
+                    } else {
+                        if should_opt_cpu() {
+                            debug!("all GPU is full for Multiexp, opt_cpu told us to run on cpu don't sleep but use cpu");
+                            cpu_start();
+                            bell_finish();
+                            return (None, 99, false)
+                        } else {
+                            let sleep_time = Duration::from_millis(WAIT_GPU);
+                            debug!("all GPU is full for Multiexp, sleep {:?} MS", WAIT_GPU);
+                            sleep(sleep_time);
+                        }
+                    }
+                } else {
+                    if should_opt_cpu() {
+                        debug!("all GPU is full for Multiexp, opt_cpu told us to run on cpu don't sleep but use cpu");
+                        cpu_start();
+                        bell_finish();
+                        return (None, 99, false)
+                    } else {
+                        let sleep_time = Duration::from_millis(WAIT_GPU);
+                        debug!("hashing thread is using GPU, sleep {:?} MS", WAIT_GPU);
+                        sleep(sleep_time);
+                    }
+                }
+            }
+        }
+        else {
+            info!("Use CPU");
+            return ( None, 99, false)
+        };
+    }
+
+}
+
+pub fn get_me_kernels_g2<E: Engine>(_n: usize, post:bool, mem: usize, priority: bool) -> (Option<LockedMultiexpKernel<'static, E::G2Affine>>, usize, bool)
+    where
+        <E as Engine>::G2Affine: GpuName
+{
+    let start_time = Instant::now();
+    if post {
+        info!("post me kernel!");
+        let post_kernel = Some(LockedMultiexpKernel::<E::G2Affine>::new(priority, None));
+        return (post_kernel, 99, false)
+    } else {
+        info!("[get_me_kernels_g2] get!!!!!");
+        if GPU_BELL() {
+            bell_start();
+            let mut rng = rand::thread_rng();
+            loop {
+                if !hash_rnning() {
+                    let rand_sleep = rng.gen_range(0..10);
+                    debug!("Random sleep {:?} MS", rand_sleep);
+                    sleep(Duration::from_millis(rand_sleep));
+                    let (gpu_ok, min_idx, gpu_id) = free_gpu_ok(mem);
+                    if gpu_ok {
+                        if !gpu_overloaded(min_idx) {
+                            let kern_2 = {
+                                Some(LockedMultiexpKernel::<E::G2Affine>::new(priority, Some(gpu_id)))
+                            };
+                            bell_finish();
+                            info!("GPU get_me_kernels_g2 takes: {:?}", start_time.elapsed());
+                            return (kern_2, min_idx, true)
+                        } else {
+                            let start_sub = Instant::now();
+                            finish_use_gpu(min_idx, mem);
+                            info!("BELL fetch sub takes: {:?}, abnormal situation", start_sub.elapsed());
+                            let sleep_time = Duration::from_millis(WAIT_GPU);
+                            debug!("Competition happened, all GPU is full for Multi exp, sleep {:?} MS", WAIT_GPU);
+                            sleep(sleep_time);
+                        }
+                    } else {
+                        if should_opt_cpu() {
+                            debug!("all GPU is full for Multi exp, opt_cpu told us to run on cpu don't sleep but use cpu");
+                            cpu_start();
+                            bell_finish();
+                            return (None, 99, false)
+                        } else {
+                            let sleep_time = Duration::from_millis(WAIT_GPU);
+                            debug!("all GPU is full for Multi exp, sleep {:?} MS", WAIT_GPU);
+                            sleep(sleep_time);
+                        }
+                    }
+                } else {
+                    if should_opt_cpu() {
+                        debug!("all GPU is full for Multi exp, opt_cpu told us to run on cpu don't sleep but use cpu");
+                        cpu_start();
+                        bell_finish();
+                        return (None, 99, false)
+                    } else {
+                        let sleep_time = Duration::from_millis(WAIT_GPU);
+                        debug!("hashing thread is using GPU, sleep {:?} MS", WAIT_GPU);
+                        sleep(sleep_time);
+                    }
+                }
+            }
+        }
+        else {
+            info!("Use CPU");
+            return ( None, 99, false)
+        };
+    }
+
+}
+
+pub fn finish_syntheize() {
+    let thread_num = RNNING_SYN_THREAD_NUM.fetch_sub(1, Ordering::SeqCst);
+    info!("finish_syntheize_thread, current running synthesize threads is {:?}", thread_num);
+}
+
+pub fn start_gpu_thread() {
+    let thread_num = RNNING_GPU_THREAD_NUM.fetch_add(1, Ordering::SeqCst);
+    info!("start_gpu_thread, current running gpu threads is {:?}", thread_num);
+}
+
+pub fn finish_gpu_thread() {
+    let thread_num = RNNING_GPU_THREAD_NUM.fetch_sub(1, Ordering::SeqCst);
+    info!("finish_gpu_thread, current running gpu threads is {:?}", thread_num);
+}
+
+pub fn sleep_time(sleep_number: u32) -> u64{
+    match sleep_number {
+        0..=10 => 6000,
+        11..=50 => 3000,
+        51..=100 => 1500,
+        101..=500 => 800,
+        501..=1000 => 400,
+        1001..=2001 => 200,
+        _ => 100,
+
+    }
+}
+
+pub fn start_synthesize() {
+    let mut sleep_number = 0;
+    let this_thread_num = THIS_THREAD_NUM.fetch_add(1, Ordering::SeqCst);
+    loop {
+        let mut rng = rand::thread_rng();
+
+        let sleep_time = rng.gen_range(0..SYNTHESIZE_SLEEP_TIME());
+        debug!("sleep {:?} MS to wait synthesize for thread num {:?}!", sleep_time, this_thread_num);
+        if (RNNING_SYN_THREAD_NUM.load(Ordering::SeqCst) < NUM_PROVING_THREAD()) &&
+            ( (get_waiting_bell() <= MAX_BELL_GPU_THREAD_NUM()) || (RNNING_SYN_THREAD_NUM.load(Ordering::SeqCst) == 0 && MAX_BELL_GPU_THREAD_NUM()>=4))
+            && (this_thread_num == RNNING_THREAD_NUM.load(Ordering::SeqCst)+1)
+            && (CACHE_BUILDING.load(Ordering::SeqCst) == 0){
+            RNNING_THREAD_NUM.fetch_add(1, Ordering::SeqCst);
+            RNNING_SYN_THREAD_NUM.fetch_add(1, Ordering::SeqCst);
+            if this_thread_num == 1 {
+                CACHE_BUILDING.fetch_add(1, Ordering::SeqCst);
+            }
+            info!("MAX_BELL_GPU_THREAD_NUM is {:?}", MAX_BELL_GPU_THREAD_NUM());
+            info!("Thread num {:?} get through to start synthesize with running synthesize thread {:?} and waiting bellman tasks {:?}", this_thread_num, RNNING_SYN_THREAD_NUM.load(Ordering::SeqCst), get_waiting_bell());
+            return
+        } else {
+            sleep(Duration::from_millis(sleep_time as u64));
+        }
+    }
+}
+
+pub fn get_fft_kernals<F: ec_gpu::GpuName + ff::Field>(log_d: usize, post: bool, mem: usize, priority: bool) -> (Option<LockedFftKernel<'static, F>>, usize, bool)
+
+{
+    if post {
+        (Some(LockedFftKernel::new(priority, None)), 99, false)
+    } else {
+        info!("[get_fft_kernals] get!!!!");
+        if GPU_BELL() {
+            bell_start();
+            let mut rng = rand::thread_rng();
+            loop {
+                if !hash_rnning() {
+                    let rand_sleep = rng.gen_range(0..10);
+                    debug!("Random sleep {:?} MS", rand_sleep);
+                    sleep(Duration::from_millis(rand_sleep));
+                    let (gpu_ok, min_idx, gpu_id) = free_gpu_ok(mem);
+                    if gpu_ok {
+                        if !gpu_overloaded(min_idx) {
+                            let kern_1 = if inplace_fft(log_d) {
+                                let res = {
+                                    LockedFftKernel::new(priority, Some(gpu_id))
+                                };
+                                res
+                            } else {
+                                LockedFftKernel::new(priority, Some(gpu_id))
+                            };
+                            bell_finish();
+                            return (Some(kern_1), min_idx, true)
+                        } else {
+                            let start_sub = Instant::now();
+                            finish_use_gpu(min_idx, mem);
+                            info!("BELL fetch sub takes: {:?}, abnormal situation", start_sub.elapsed());
+                            let sleep_time = Duration::from_millis(WAIT_GPU);
+                            debug!("Competition happend, all GPU is full for FFT, sleep {:?} MS", WAIT_GPU);
+                            sleep(sleep_time);
+                        }
+                    } else {
+                        if should_opt_cpu() {
+                            debug!("all GPU is full for FFT, opt_cpu told us to run on cpu don't sleep but use cpu");
+                            cpu_start();
+                            bell_finish();
+                            return ( None, 99, false)
+                        } else {
+                            let sleep_time = Duration::from_millis(WAIT_GPU);
+                            debug!("all GPU is full for FFT, sleep {:?} MS", WAIT_GPU);
+                            sleep(sleep_time);
+                        }
+                    }
+                } else {
+                    if should_opt_cpu() {
+                        debug!("all GPU is full for FFT, opt_cpu told us to run on cpu don't sleep but use cpu");
+                        cpu_start();
+                        bell_finish();
+                        return (None, 99, false)
+                    }
+                    else {
+                        let sleep_time = Duration::from_millis(WAIT_GPU);
+                        info!("hashing thread is using GPU, sleep {:?} MS", WAIT_GPU);
+                        sleep(sleep_time);
+                    }
+                }
+            }
+        }
+        else {
+            info!("Use CPU");
+            return (None, 99, false)
+        };
+    }
+
+}
+
+#[allow(clippy::needless_collect)]
+pub fn create_random_proof_batch_priority_with_verify<E, C, R, P: ParameterSource<E>>(
+    circuits: Vec<C>,
+    circuits_retry: Vec<C>,
+    params: P,
+    rng: &mut R,
+    priority: bool,
+    public_inputs: &[Vec<E::Fr>],
+    pvk: &PreparedVerifyingKey<E>,
+) -> Result<Vec<Proof<E>>, SynthesisError>
+    where
+        E: MultiMillerLoop,
+        C: Circuit<E::Fr> + Send,
+        E::Fr: GpuName,
+        E::G1Affine: GpuName,
+        E::G2Affine: GpuName,
+        R: RngCore,
+{
+    info!("Start a batch zksnark creation");
+    if NO_CUSTOM() || priority {
+        info!("Do NOT use cusomization zksnark routine!!");
+        info!("Bellperson {} is being used!", BELLMAN_VERSION);
+        let r_s = (0..circuits.len())
+            .map(|_| E::Fr::random(&mut *rng))
+            .collect();
+        let s_s = (0..circuits.len())
+            .map(|_| E::Fr::random(&mut *rng))
+            .collect();
+
+        create_proof_batch_priority::<E, C, P>(circuits, params, r_s, s_s, priority)
+    } else {
+        info!("Do use cusomization zksnark routine!!");
+
+        let r = E::Fr::random(&mut *rng);
+        let s = E::Fr::random(&mut *rng);
+
+        info!("r value is {:?}", r);
+        info!("s value is {:?}", s);
+
+        info!("circuits length is {:?}", circuits.len());
+
+        let arc_params = Arc::new(params);
+        let res = crossbeam::thread::scope(|scope| -> Vec<Proof<E>> {
+            let handlers: Vec<_> = circuits.into_iter().zip(public_inputs.into_iter()).zip(circuits_retry.into_iter()).map(|((circuit, public_input), circuit_retry)| {
+                let r_cloned = r.clone();
+                let s_cloned = s.clone();
+                let p_cloned = priority.clone();
+                let arc_params_clone = arc_params.clone();
+                let r_retry = E::Fr::random(&mut *rng);
+                let s_retry = E::Fr::random(&mut *rng);
+
+                scope.spawn(move |_| {
+
+                    let res = create_proof_single_priority(circuit, arc_params_clone.clone(), r_cloned, s_cloned, p_cloned).unwrap();
+                    let verify_res = verify_proof(pvk, &res, public_input).unwrap();
+                    if verify_res == false {
+                        info!("Retry this particular zksnark coz it's failed!!!!!!!!!");
+                        let res_retry = create_proof_single_priority(circuit_retry, arc_params_clone, r_retry, s_retry, p_cloned).unwrap();
+                        res_retry
+                    } else {
+                        info!("Bellman verify partition success");
+                        res
+                    }
+                })
+            }).collect();
+            handlers.into_iter().map(|handler| {
+                handler.join().unwrap()
+            }).collect()
+        }).unwrap();
+        info!("r value is {:?}", r);
+        info!("s value is {:?}", s);
+        info!("Before end!!!");
+        Ok(res)
     }
 }

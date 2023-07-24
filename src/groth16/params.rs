@@ -430,7 +430,29 @@ where
         num_inputs: usize,
         num_aux: usize,
     ) -> Result<(Self::G2Builder, Self::G2Builder), SynthesisError>;
+
+    fn get_h_cached(&self, num_h: usize, key:usize) -> Result<Self::G1Builder, SynthesisError>;
+    fn get_l_cached(&self, num_l: usize, key:usize) -> Result<Self::G1Builder, SynthesisError>;
+    fn get_a_cached(
+        &self,
+        num_inputs: usize,
+        num_aux: usize,
+        key:usize
+    ) -> Result<(Self::G1Builder, Self::G1Builder), SynthesisError>;
+    fn get_b_g1_cached(
+        &self,
+        num_inputs: usize,
+        num_aux: usize,
+        key:usize
+    ) -> Result<(Self::G1Builder, Self::G1Builder), SynthesisError>;
+    fn get_b_g2_cached(
+        &self,
+        num_inputs: usize,
+        num_aux: usize,
+        key:usize
+    ) -> Result<(Self::G2Builder, Self::G2Builder), SynthesisError>;
 }
+
 
 impl<'a, E> ParameterSource<E> for &'a Parameters<E>
 where
@@ -474,4 +496,36 @@ where
     ) -> Result<(Self::G2Builder, Self::G2Builder), SynthesisError> {
         Ok(((self.b_g2.clone(), 0), (self.b_g2.clone(), num_inputs)))
     }
+
+    fn get_h_cached(&self, _: usize, _:usize) -> Result<Self::G1Builder, SynthesisError> {
+        Ok((self.h.clone(), 0))
+    }
+    fn get_l_cached(&self, _: usize, _:usize) -> Result<Self::G1Builder, SynthesisError> {
+        Ok((self.l.clone(), 0))
+    }
+    fn get_a_cached(
+        &self,
+        num_inputs: usize,
+        _: usize,
+        _:usize
+    ) -> Result<(Self::G1Builder, Self::G1Builder), SynthesisError> {
+        Ok(((self.a.clone(), 0), (self.a.clone(), num_inputs)))
+    }
+    fn get_b_g1_cached(
+        &self,
+        num_inputs: usize,
+        _: usize,
+        _:usize
+    ) -> Result<(Self::G1Builder, Self::G1Builder), SynthesisError> {
+        Ok(((self.b_g1.clone(), 0), (self.b_g1.clone(), num_inputs)))
+    }
+    fn get_b_g2_cached(
+        &self,
+        num_inputs: usize,
+        _: usize,
+        _:usize
+    ) -> Result<(Self::G2Builder, Self::G2Builder), SynthesisError> {
+        Ok(((self.b_g2.clone(), 0), (self.b_g2.clone(), num_inputs)))
+    }
 }
+
