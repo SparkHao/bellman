@@ -85,10 +85,12 @@ where
     ) -> EcResult<Self> {
         info!("Multiexp: CPU utilization: {}.", get_cpu_utilization());
         set_custom_gpu_env_var();
+        info!("CpuGpuMultiexpKernel create_with_abort");
         let programs = devices
             .iter()
             .map(|device| ec_gpu_gen::program!(device))
             .collect::<Result<_, _>>()?;
+        info!("before multiexpkernel create_with_abort!!");
         let kernel = MultiexpKernel::create_with_abort(programs, devices, maybe_abort)?;
         Ok(Self(kernel))
     }
