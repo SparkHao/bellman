@@ -65,10 +65,12 @@ where
     pub fn create(devices: &[&Device]) -> EcResult<Self> {
         info!("Multiexp: CPU utilization: {}.", get_cpu_utilization());
         set_custom_gpu_env_var();
+        info!("CpuGpuMultiexpKernel create");
         let programs = devices
             .iter()
             .map(|device| ec_gpu_gen::program!(device))
             .collect::<Result<_, _>>()?;
+        info!("before multiexpkernel create!!");
         let kernel = MultiexpKernel::create(programs, devices)?;
         Ok(Self(kernel))
     }

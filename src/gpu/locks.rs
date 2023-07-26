@@ -91,12 +91,12 @@ impl<'a> GPULock<'a> {
 
         // Fallback to create single lock
         let path = tmp_path(GPU_LOCK_NAME, None);
-        debug!("Acquiring GPU lock at {:?} ...", &path);
+        info!("Acquiring GPU lock at {:?} ...", &path);
         let file = File::create(&path).unwrap_or_else(|_| {
             panic!("Cannot create GPU lock file at {:?}", &path);
         });
         file.lock_exclusive().unwrap();
-        debug!("GPU lock acquired at {:?}", path);
+        info!("GPU lock acquired at {:?}", path);
         GPULock(vec![LockInfo {
             file,
             path,
