@@ -374,7 +374,7 @@ where
     THREAD_POOL.scoped(|s| -> Result<(), SynthesisError> {
         let params_h = &mut params_h;
         s.execute(move || {
-            debug!("get h");
+            info!("get h");
             *params_h = Some(params.get_h(n));
         });
 
@@ -394,11 +394,11 @@ where
     THREAD_POOL.scoped(|s| {
         let params_l = &mut params_l;
         s.execute(move || {
-            debug!("get l");
+            info!("get l");
             *params_l = Some(params.get_l(aux_assignment_len));
         });
 
-        debug!("multiexp h");
+        info!("multiexp h");
         for a in a_s.into_iter() {
             h_s.push(multiexp(
                 worker,
@@ -425,7 +425,7 @@ where
         let params_b_g1 = &mut params_b_g1;
         let params_b_g2 = &mut params_b_g2;
         s.execute(move || {
-            debug!("get_a b_g1 b_g2");
+            info!("get_a b_g1 b_g2");
             *params_a = Some(params.get_a(input_len, a_aux_density_total));
             if zk {
                 *params_b_g1 = Some(params.get_b_g1(b_input_density_total, b_aux_density_total));
@@ -433,7 +433,7 @@ where
             *params_b_g2 = Some(params.get_b_g2(b_input_density_total, b_aux_density_total));
         });
 
-        debug!("multiexp l");
+        info!("multiexp l");
         for aux in aux_assignments.iter() {
             l_s.push(multiexp(
                 worker,
@@ -445,7 +445,7 @@ where
         }
     });
 
-    debug!("get a b_g1");
+    info!("get a b_g1");
     let (a_inputs_source, a_aux_source) = params_a.unwrap()?;
     let params_b_g1_opt = params_b_g1.transpose()?;
 
@@ -464,7 +464,7 @@ where
         .collect::<Vec<_>>();
     drop(provers);
 
-    debug!("multiexp a b_g1");
+    info!("multiexp a b_g1");
     let inputs_g1 = input_assignments
         .iter()
         .zip(aux_assignments.iter())
@@ -525,10 +525,10 @@ where
     // it would block, trying to acquire the GPU lock.
     let mut multiexp_g2_kern = LockedMultiexpKernel::<E::G2Affine>::new(priority, None);
 
-    debug!("get b_g2");
+    info!("get b_g2");
     let (b_g2_inputs_source, b_g2_aux_source) = params_b_g2.unwrap()?;
 
-    debug!("multiexp b_g2");
+    info!("multiexp b_g2");
     let inputs_g2 = input_assignments
         .iter()
         .zip(aux_assignments.iter())
