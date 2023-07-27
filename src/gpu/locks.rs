@@ -203,9 +203,7 @@ where
     };
     info!("create_fft_kernel idx: {:?}, device: {:?}", idx, &devices);
 
-
-    let programs = lock
-        .devices()
+    let programs = devices
         .iter()
         .map(|device| ec_gpu_gen::program!(device))
         .collect::<Result<_, _>>()
