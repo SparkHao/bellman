@@ -194,6 +194,16 @@ where
     F: Field + GpuName,
 {
     let lock = GPULock::lock();
+
+    let devices = Device::all();
+    let devices = if idx.is_some() {
+        vec![devices[idx.unwrap()]]
+    }else {
+        devices
+    };
+    info!("create_fft_kernel idx: {:?}, device: {:?}", idx, &devices);
+
+
     let programs = lock
         .devices()
         .iter()
@@ -227,7 +237,15 @@ where
     G: PrimeCurveAffine + GpuName,
 {
     let lock = GPULock::lock();
-    let devices = lock.devices();
+    // let devices = lock.devices();
+
+    let devices = Device::all();
+    let devices = if idx.is_some() {
+        vec![devices[idx.unwrap()]]
+    }else {
+        devices
+    };
+    info!("create_multiexp_kernel idx: {:?}, device: {:?}", idx, &devices);
 
     let kernel = if priority {
         CpuGpuMultiexpKernel::create(&devices)
